@@ -158,9 +158,22 @@ def get_cups_printers():
 
 # Paper sizes mirroring the dashboard's PAPER_SIZES constant
 PAPER_SIZES = {
+    "29mmx90mm":       {"width": 90, "height": 29},
     "Brother-QL800":   {"width": 62, "height": 29},
     "Dymo-TwinTurbo":  {"width": 89, "height": 36},
-    "29mmx90mm":       {"width": 90, "height": 29},
+    "Dymo-30252":      {"width": 89, "height": 28},
+    "Brother-DK2205":  {"width": 62, "height": 100},
+    "Zebra-2x1":       {"width": 51, "height": 25},
+}
+
+# Map CUPS printer names to their default paper size key
+PRINTER_DEFAULTS = {
+    "Brother_QL_800":                 "29mmx90mm",
+    "Brother_QL_800_2":               "29mmx90mm",
+    "GODEX":                          "29mmx90mm",
+    "Canon_TS3500_series":            None,
+    "HP_LaserJet_400_M401n__B429A7_": None,
+    "HP_LaserJet_Pro_M118_M119":      None,
 }
 
 
@@ -169,6 +182,12 @@ def print_pdf(pdf_path, printer_name, copies=1, paper_size=None):
     Send a PDF to a CUPS printer via `lp`.
     Returns (success: bool, message: str).
     """
+    # If no paper size provided, look up printer default
+    if not paper_size and printer_name:
+        paper_size = PRINTER_DEFAULTS.get(printer_name)
+        if paper_size:
+            add_log(f"  Paper size from printer defaults: {paper_size}")
+
     cmd = ["lp"]
     if printer_name:
         cmd += ["-d", printer_name]
@@ -179,16 +198,18 @@ def print_pdf(pdf_path, printer_name, copies=1, paper_size=None):
     # Fit the PDF to the label media
     cmd += ["-o", "fit-to-page"]
 
-    # Determine orientation from paper size — if width > height, it's landscape
+    # Set media size if we have a known paper size
     ps = PAPER_SIZES.get(paper_size or "")
-    if ps and ps["width"] > ps["height"]:
-        # orientation-requested=4 = landscape (90° CCW rotation)
-        cmd += ["-o", "orientation-requested=4"]
-        add_log(f"  Orientation: landscape (paper {paper_size}: {ps['width']}x{ps['height']}mm)")
-    else:
-        # Even if unknown, label stock is almost always landscape
-        cmd += ["-o", "orientation-requested=4"]
-        add_log(f"  Orientation: landscape (default for label stock)")
+    if ps:
+        # Set CUPS media size in mm  (e.g. "Custom.90x29mm")
+        cmd += ["-o", f"media=Custom.{ps['width']}x{ps['height']}mm"]
+        add_log(f"  Media: {paper_size} ({ps['width']}x{ps['height']}mm)")
+
+    # Do NOT set orientation-requested — the PDF is already generated with
+    # the correct landscape page dimensions by the dashboard (pdf-lib).
+    # The Brother QL driver ignores or double-rotates this flag, causing
+    # portrait output. Letting CUPS auto-detect avoids the problem.
+    add_log(f"  Orientation: auto (PDF has correct page dimensions)")
 
     cmd.append(pdf_path)
 
