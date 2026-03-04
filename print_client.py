@@ -60,11 +60,14 @@ log = logging.getLogger("ql-print-client")
 
 polling_active = False
 poll_thread = None
+heartbeat_thread = None
 print_log = []       # Recent activity log entries
 print_errors = []    # Recent errors
+log_forward_buffer = []  # Logs queued for Firebase forwarding
 job_stats = {"completed": 0, "failed": 0, "total_polled": 0}
 
 MAX_LOG_ENTRIES = 200
+HEARTBEAT_INTERVAL = 30  # seconds between heartbeats
 
 # ─── HTTP Helpers ────────────────────────────────────────────────────
 
@@ -90,8 +93,16 @@ def api_post(path, data=None):
     return resp.json()
 
 
-def add_log(message, level="info"):
-    """Append to in-memory log visible on the dashboard."""
+def api_put(path, data=None):
+    resp = http_requests.put(
+        f"{SERVER_URL}{path}", headers=HEADERS, json=data or {}, timeout=15
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def add_log(message, level="info", job_id=None, printer=None):
+    """Append to in-memory log visible on the dashboard and queue for Firebase."""
     entry = {
         "time": datetime.now().strftime("%H:%M:%S"),
         "level": level,
@@ -105,6 +116,15 @@ def add_log(message, level="info"):
         print_errors.append(entry)
         if len(print_errors) > 50:
             del print_errors[:10]
+
+    # Queue for Firebase forwarding
+    log_forward_buffer.append({
+        "level": level,
+        "message": message,
+        "timestamp": datetime.now().isoformat(),
+        "jobId": job_id,
+        "printer": printer,
+    })
 
     log_fn = log.error if level == "error" else (log.warning if level == "warn" else log.info)
     log_fn(message)
@@ -186,7 +206,7 @@ def process_job(job):
     template = job.get("templateName") or job.get("formName") or "Unknown"
     copies = job.get("copies", 1)
 
-    add_log(f"Processing job {job_id} — {template} (copies: {copies})")
+    add_log(f"Processing job {job_id} — {template} (copies: {copies})", job_id=job_id)
 
     # 1. Claim
     try:
@@ -258,7 +278,7 @@ def process_job(job):
         success, message = print_pdf(tmp_path, printer, copies)
 
         if success:
-            add_log(f"  Printed successfully: {message}")
+            add_log(f"  Printed successfully: {message}", job_id=job_id, printer=printer)
             api_post(f"/api/print/jobs/{job_id}/complete", {
                 "clientId": CLIENT_ID,
                 "printDetails": {
@@ -270,7 +290,7 @@ def process_job(job):
             })
             job_stats["completed"] += 1
         else:
-            add_log(f"  Print failed: {message}", "error")
+            add_log(f"  Print failed: {message}", "error", job_id=job_id, printer=printer)
             api_post(f"/api/print/jobs/{job_id}/fail", {
                 "clientId": CLIENT_ID,
                 "errorMessage": f"CUPS error: {message}",
@@ -352,6 +372,55 @@ def poll_loop():
             time.sleep(POLL_INTERVAL)
 
     add_log("Polling stopped")
+
+
+# ─── Heartbeat & Log Forwarding ─────────────────────────────────────
+
+
+def heartbeat_loop():
+    """Background thread: sends heartbeat + forwards logs to Firebase."""
+    global polling_active
+
+    while polling_active:
+        try:
+            # Send heartbeat
+            printers, _ = get_cups_printers()
+            api_post("/api/print/clients/heartbeat", {
+                "clientId": CLIENT_ID,
+                "printerCount": len(printers),
+                "stats": job_stats.copy(),
+            })
+        except Exception:
+            pass  # Heartbeat failures are silent
+
+        try:
+            # Forward buffered logs
+            if log_forward_buffer:
+                batch = log_forward_buffer[:50]
+                api_post("/api/print/logs", {
+                    "clientId": CLIENT_ID,
+                    "entries": batch,
+                })
+                del log_forward_buffer[:len(batch)]
+        except Exception:
+            pass  # Log forwarding failures are silent — logs stay in buffer
+
+        try:
+            # Update printer statuses
+            printers, _ = get_cups_printers()
+            if printers:
+                statuses = [
+                    {"systemName": name, "name": name, "status": "online" if st == "idle" else st}
+                    for name, st in printers
+                ]
+                api_put("/api/print/printers/status", {
+                    "clientId": CLIENT_ID,
+                    "statuses": statuses,
+                })
+        except Exception:
+            pass
+
+        time.sleep(HEARTBEAT_INTERVAL)
 
 
 # ─── Flask App ───────────────────────────────────────────────────────
@@ -544,37 +613,48 @@ def get_log():
 
 @app.route("/api/polling/start", methods=["POST"])
 def start_polling():
-    global polling_active, poll_thread
+    global polling_active, poll_thread, heartbeat_thread
     if polling_active:
         return jsonify({"message": "Already polling"})
     polling_active = True
     poll_thread = threading.Thread(target=poll_loop, daemon=True)
     poll_thread.start()
 
+    # Start heartbeat / log forwarding thread
+    heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+    heartbeat_thread.start()
+
     # Register with server on start
     try:
         api_post("/api/print/clients/register", {
             "clientId": CLIENT_ID,
-            "clientName": CLIENT_NAME,
-            "version": "2.0.0",
+            "name": CLIENT_NAME,
+            "description": f"QL Print Client v2.0 on {os.uname().nodename if hasattr(os, 'uname') else 'unknown'}",
         })
         add_log("Registered with server")
     except Exception as e:
         add_log(f"Registration failed: {e}", "warn")
 
-    # Register printers
+    # Register printers (batch format expected by Firebase)
     try:
         printers, default = get_cups_printers()
-        for name, st in printers:
+        if printers:
+            printer_list = [
+                {
+                    "name": name,
+                    "systemName": name,
+                    "systemPrinterName": name,
+                    "type": "Label Printer",
+                    "connectionType": "usb",
+                    "status": "online" if st == "idle" else st,
+                }
+                for name, st in printers
+            ]
             api_post("/api/print/printers", {
                 "clientId": CLIENT_ID,
-                "name": name,
-                "systemName": name,
-                "systemPrinterName": name,
-                "status": "Online" if st == "idle" else st,
-                "online": st == "idle",
+                "printers": printer_list,
             })
-        add_log(f"Registered {len(printers)} printer(s) with server")
+            add_log(f"Registered {len(printers)} printer(s) with server")
     except Exception as e:
         add_log(f"Printer registration failed: {e}", "warn")
 
@@ -616,10 +696,47 @@ def main():
         log.warning("  No CUPS printers detected!")
 
     # Auto-start polling
-    global polling_active, poll_thread
+    global polling_active, poll_thread, heartbeat_thread
     polling_active = True
     poll_thread = threading.Thread(target=poll_loop, daemon=True)
     poll_thread.start()
+
+    # Auto-start heartbeat / log forwarding
+    heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+    heartbeat_thread.start()
+
+    # Register with server
+    try:
+        api_post("/api/print/clients/register", {
+            "clientId": CLIENT_ID,
+            "name": CLIENT_NAME,
+            "description": f"QL Print Client v2.0",
+        })
+        log.info("  Registered with server")
+    except Exception as e:
+        log.warning(f"  Registration failed: {e}")
+
+    # Register printers (batch)
+    if printers:
+        try:
+            printer_list = [
+                {
+                    "name": name,
+                    "systemName": name,
+                    "systemPrinterName": name,
+                    "type": "Label Printer",
+                    "connectionType": "usb",
+                    "status": "online" if st == "idle" else st,
+                }
+                for name, st in printers
+            ]
+            api_post("/api/print/printers", {
+                "clientId": CLIENT_ID,
+                "printers": printer_list,
+            })
+            log.info(f"  Registered {len(printers)} printer(s)")
+        except Exception as e:
+            log.warning(f"  Printer registration failed: {e}")
 
     log.info(f"  Dashboard: http://localhost:{FLASK_PORT}")
     log.info("")
