@@ -129,16 +129,6 @@ DEFAULT_PRINTER="Brother_QL_800" POLL_INTERVAL=3 ~/ql-print-client/start.sh
 
 ---
 
-## Remote Worker Access
-
-This system is cloud-based — no VPN or port forwarding needed:
-
-- **Remote workers** create and queue labels from anywhere via the admin dashboard
-- **This print client** at the shop pulls jobs from the cloud and prints them locally
-- Monitor from any device on the same Wi-Fi: `http://[shop-mac-ip]:7010`
-
----
-
 ## Printer Setup (Brother QL-800)
 
 The Brother QL-800 should already be set up on your Mac. To verify:
@@ -227,3 +217,4 @@ After installation:
   start.sh              ← Quick launcher
   config.json           ← (in ~/Library/Application Support/QLPrintClient/)
 ```
+
