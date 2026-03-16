@@ -12,6 +12,7 @@ Designed for Brother QL-800 label printers on macOS.
 
 import os
 import sys
+import re
 import time
 import json
 import base64
@@ -188,10 +189,18 @@ BROTHER_QL_PAGESIZE = {
     (17, 87): "DC02",
     (23, 23): "DC20",
     (29, 42): "DC08",
-    (29, 90): "DC03",   # 1.1" x 3.5" standard address/tire label
+    (29, 62): "DC29x62mm",  # Brother QL-800 62×29mm label
+    (29, 90): "DC03",       # 1.1" x 3.5" standard address/tire label
     (38, 90): "DC04",
     (39, 48): "DC17",
     (52, 29): "DC24",
+}
+
+# Map dashboard cupsMedia strings to CUPS PageSize codes for fallback
+CUPS_MEDIA_TO_PAGESIZE = {
+    "DC29x90mm": "DC03",
+    "DC29x62mm": "DC29x62mm",
+    "DC62mm":    "DC62mm",
 }
 
 
@@ -216,7 +225,7 @@ def get_pdf_dimensions_mm(pdf_path):
     return None, None
 
 
-def print_pdf(pdf_path, printer_name, copies=1, paper_size=None):
+def print_pdf(pdf_path, printer_name, copies=1, paper_size=None, orientation=None):
     """
     Send a PDF to a CUPS printer via `lp`.
     Returns (success: bool, message: str).
@@ -236,45 +245,64 @@ def print_pdf(pdf_path, printer_name, copies=1, paper_size=None):
 
     # Read actual PDF dimensions to decide media + orientation
     pdf_w, pdf_h = get_pdf_dimensions_mm(pdf_path)
-    pdf_is_landscape = pdf_w is not None and pdf_w > pdf_h
+    add_log(f"  PDF dimensions detected: {pdf_w}x{pdf_h}mm (from file)")
 
     is_brother_ql = printer_name and "Brother_QL" in printer_name
 
-    # fit-to-page causes a double-rotation on Brother QL printers:
-    # CUPS rotates the landscape PDF to fit portrait media, then
-    # orientation-requested=4 rotates it again → text prints sideways.
-    # Use scaling=100 for Brother QL so only our explicit orientation flag applies.
+    # For Brother QL: never use fit-to-page — it auto-rotates landscape
+    # PDFs to fit portrait media, conflicting with our explicit rotation.
     if is_brother_ql:
         cmd += ["-o", "scaling=100"]
     else:
         cmd += ["-o", "fit-to-page"]
 
-    if is_brother_ql and pdf_w is not None:
-        # Map PDF dims to the correct Brother PPD PageSize code.
-        # DC codes are defined portrait (narrow × long), so normalise to
-        # (min_dim, max_dim) regardless of PDF orientation.
-        key = (round(min(pdf_w, pdf_h)), round(max(pdf_w, pdf_h)))
-        dc_code = BROTHER_QL_PAGESIZE.get(key)
+    if is_brother_ql:
+        # Determine if the PDF is landscape (either from measured dims or job metadata)
+        if pdf_w is not None:
+            pdf_is_landscape = pdf_w > pdf_h
+        elif orientation:
+            pdf_is_landscape = orientation == "landscape"
+            add_log(f"  PDF dims unavailable; using job orientation: {orientation}")
+        else:
+            # Last resort: most Brother QL labels from the dashboard are landscape
+            pdf_is_landscape = True
+            add_log(f"  PDF dims unavailable, no orientation in job; assuming landscape")
+
+        # Pick the CUPS PageSize code
+        if pdf_w is not None:
+            key = (round(min(pdf_w, pdf_h)), round(max(pdf_w, pdf_h)))
+            dc_code = BROTHER_QL_PAGESIZE.get(key)
+        else:
+            dc_code = None
+
+        # If dimension-based lookup missed, try the cupsMedia string from the job
+        if not dc_code and paper_size:
+            dc_code = CUPS_MEDIA_TO_PAGESIZE.get(paper_size)
+            if dc_code:
+                add_log(f"  PageSize from job paperSize '{paper_size}': {dc_code}")
 
         if dc_code:
             cmd += ["-o", f"PageSize={dc_code}"]
-            add_log(f"  Media: {dc_code} ({key[0]}x{key[1]}mm)")
-        else:
-            # Unknown label size — use Custom portrait dimensions
+            if pdf_w is not None:
+                add_log(f"  Media: {dc_code} ({key[0]}x{key[1]}mm)")
+            else:
+                add_log(f"  Media: {dc_code} (from job metadata)")
+        elif pdf_w is not None:
             portrait_w = round(min(pdf_w, pdf_h), 2)
             portrait_h = round(max(pdf_w, pdf_h), 2)
             cmd += ["-o", f"PageSize=Custom.{portrait_w}x{portrait_h}mm"]
             add_log(f"  Media: Custom.{portrait_w}x{portrait_h}mm (unrecognised label size)")
+        else:
+            add_log(f"  Media: default (no dimensions or paperSize available)", "warn")
 
         if pdf_is_landscape:
-            # PDF is landscape; DC codes are portrait → rotate 90° CCW to fill media
             cmd += ["-o", "orientation-requested=4"]
-            add_log(f"  Orientation: landscape→portrait rotation (PDF {pdf_w}x{pdf_h}mm)")
+            add_log(f"  Orientation: landscape → rotate 90° CCW for portrait tape feed")
         else:
-            add_log(f"  Orientation: none (PDF already portrait {pdf_w}x{pdf_h}mm)")
+            add_log(f"  Orientation: portrait (no rotation needed)")
 
     else:
-        # Non-Brother printer: use Custom media size from PAPER_SIZES
+        # Non-Brother printer
         ps = PAPER_SIZES.get(paper_size or "")
         if ps:
             cmd += ["-o", f"media=Custom.{ps['width']}x{ps['height']}mm"]
@@ -387,9 +415,10 @@ def process_job(job):
             tmp_path = tmp.name
         add_log(f"  PDF decoded: {len(pdf_bytes)} bytes -> {tmp_path}")
 
-        # 4. Print (pass paper size for correct orientation)
+        # 4. Print (pass paper size + orientation for correct printing)
         paper_size = job.get("paperSize", "")
-        success, message = print_pdf(tmp_path, printer, copies, paper_size)
+        orientation = job.get("orientation", "")
+        success, message = print_pdf(tmp_path, printer, copies, paper_size, orientation)
 
         if success:
             add_log(f"  Printed successfully: {message}", job_id=job_id, printer=printer)
