@@ -52,6 +52,10 @@ DEFAULT_PRINTER = os.environ.get("DEFAULT_PRINTER", "")
 CLIENT_ID = os.environ.get("CLIENT_ID", "ql-mac-client")
 CLIENT_NAME = os.environ.get("CLIENT_NAME", "Quality Tire Mac")
 FLASK_PORT = int(os.environ.get("FLASK_PORT", "7010"))
+FALLBACK_POLL_INTERVAL = int(os.environ.get("FALLBACK_POLL_INTERVAL", "60"))
+
+FIREBASE_DB_URL = "https://qualityexpress-c19f2-default-rtdb.firebaseio.com"
+RTDB_SIGNAL_PATH = "printers/pendingSignal"
 
 # ─── Logging ─────────────────────────────────────────────────────────
 
@@ -74,6 +78,10 @@ job_stats = {"completed": 0, "failed": 0, "total_polled": 0}
 
 MAX_LOG_ENTRIES = 200
 HEARTBEAT_INTERVAL = 30  # seconds between heartbeats
+
+# Threading event: set by the RTDB SSE listener to wake the poll loop instantly
+wake_event = threading.Event()
+rtdb_listener_active = False
 
 # ─── HTTP Helpers ────────────────────────────────────────────────────
 
@@ -422,12 +430,101 @@ def process_job(job):
 # ─── Polling Loop ────────────────────────────────────────────────────
 
 
+def start_rtdb_sse_listener():
+    """
+    Connect to Firebase RTDB REST streaming API (Server-Sent Events).
+    When the dashboard creates a print job, the Cloud Function writes a
+    signal to printers/pendingSignal. This SSE stream receives that push
+    instantly and sets wake_event to unblock the poll loop.
+
+    Uses only the `requests` library — no Firebase SDK, no credentials.
+    Runs on a daemon thread. Automatically reconnects on failure.
+    """
+    global rtdb_listener_active
+
+    sse_url = f"{FIREBASE_DB_URL}/{RTDB_SIGNAL_PATH}.json"
+
+    def sse_thread():
+        global rtdb_listener_active
+        reconnect_delay = 2
+        first_event = True
+
+        while polling_active:
+            try:
+                add_log("SSE: connecting to Firebase RTDB...")
+                resp = http_requests.get(
+                    sse_url,
+                    headers={"Accept": "text/event-stream"},
+                    stream=True,
+                    timeout=(10, None),
+                )
+                resp.raise_for_status()
+                rtdb_listener_active = True
+                reconnect_delay = 2
+                first_event = True
+
+                for raw_line in resp.iter_lines():
+                    if not polling_active:
+                        break
+                    if not raw_line:
+                        continue
+
+                    line = raw_line.decode("utf-8", errors="replace")
+
+                    if not line.startswith("data:"):
+                        continue
+
+                    payload = line[5:].strip()
+                    if not payload or payload == "null":
+                        continue
+
+                    if first_event:
+                        first_event = False
+                        continue
+
+                    try:
+                        data = json.loads(payload)
+                        if isinstance(data, dict) and data.get("data"):
+                            add_log(">>> RTDB wake-up signal received — checking for jobs")
+                            wake_event.set()
+                    except json.JSONDecodeError:
+                        pass
+
+            except http_requests.exceptions.ConnectionError:
+                rtdb_listener_active = False
+                if polling_active:
+                    add_log(f"SSE: connection lost, reconnecting in {reconnect_delay}s...", "warn")
+            except http_requests.exceptions.Timeout:
+                rtdb_listener_active = False
+                if polling_active:
+                    add_log(f"SSE: connect timeout, retrying in {reconnect_delay}s...", "warn")
+            except Exception as e:
+                rtdb_listener_active = False
+                if polling_active:
+                    add_log(f"SSE: error ({e}), reconnecting in {reconnect_delay}s...", "warn")
+
+            if polling_active:
+                time.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 30)
+
+    thread = threading.Thread(target=sse_thread, daemon=True, name="rtdb-sse")
+    thread.start()
+
+    time.sleep(1.5)
+    return rtdb_listener_active
+
+
 def poll_loop():
-    """Background thread that polls for pending jobs."""
+    """Background thread: waits for RTDB signal or fallback timeout, then checks for jobs."""
     global polling_active
     consecutive_errors = 0
 
-    add_log("Polling started")
+    # Start the SSE listener for instant wake-ups
+    has_rtdb = start_rtdb_sse_listener()
+    if has_rtdb:
+        add_log(f"Listening via Firebase RTDB (instant) + safety-net poll every {FALLBACK_POLL_INTERVAL}s")
+    else:
+        add_log(f"RTDB stream not connected yet — polling every {FALLBACK_POLL_INTERVAL}s (RTDB retrying in background)")
 
     while polling_active:
         try:
@@ -452,7 +549,6 @@ def poll_loop():
                         break
                     process_job(job)
                 consecutive_errors = 0
-                # Re-poll immediately — there may be more jobs queued
                 continue
             else:
                 consecutive_errors = 0
@@ -473,7 +569,9 @@ def poll_loop():
             time.sleep(30)
             consecutive_errors = 0
         elif polling_active:
-            time.sleep(POLL_INTERVAL)
+            # Block until RTDB signal wakes us OR fallback timeout expires
+            wake_event.wait(timeout=FALLBACK_POLL_INTERVAL)
+            wake_event.clear()
 
     add_log("Polling stopped")
 
@@ -583,7 +681,7 @@ DASHBOARD_HTML = """
 <body>
 <div class="container">
   <h1>🖨️ QL Print Client</h1>
-  <p class="subtitle">Quality Tire Label Printer — Polling
+  <p class="subtitle">Quality Tire Label Printer — SSE + Fallback Poll —
     <span id="server-url">{{ server_url }}</span></p>
 
   <!-- Status -->
@@ -593,6 +691,10 @@ DASHBOARD_HTML = """
       <div class="stat">
         <div class="value" id="poll-status">—</div>
         <div class="label">Polling</div>
+      </div>
+      <div class="stat">
+        <div class="value" id="rtdb-status">—</div>
+        <div class="label">RTDB Stream</div>
       </div>
       <div class="stat">
         <div class="value" id="printer-count">—</div>
@@ -644,6 +746,8 @@ function refreshStatus() {
   api('GET', '/api/status').then(d => {
     document.getElementById('poll-status').textContent = d.polling ? 'Active' : 'Stopped';
     document.getElementById('poll-status').className = 'value ' + (d.polling ? 'online' : 'offline');
+    document.getElementById('rtdb-status').textContent = d.rtdb_connected ? 'Connected' : 'Disconnected';
+    document.getElementById('rtdb-status').className = 'value ' + (d.rtdb_connected ? 'online' : 'warn');
     document.getElementById('printer-count').textContent = d.printers.length;
     document.getElementById('completed-count').textContent = d.stats.completed;
     document.getElementById('failed-count').textContent = d.stats.failed;
@@ -703,6 +807,7 @@ def status():
     ]
     return jsonify({
         "polling": polling_active,
+        "rtdb_connected": rtdb_listener_active,
         "server": SERVER_URL,
         "clientId": CLIENT_ID,
         "printers": printer_list,
@@ -786,7 +891,7 @@ def test_connection():
 def setup():
     """Start polling/heartbeat threads and register with server. Does NOT start Flask."""
     log.info("=" * 50)
-    log.info("QL Print Client v2.0")
+    log.info("QL Print Client v2.1 (SSE + Fallback Poll)")
     log.info("=" * 50)
     log.info(f"  Server:  {SERVER_URL}")
     log.info(f"  Client:  {CLIENT_ID}")
