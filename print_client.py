@@ -614,6 +614,7 @@ def heartbeat_loop():
                 "clientId": CLIENT_ID,
                 "printerCount": len(printers),
                 "stats": job_stats.copy(),
+                "rtdbConnected": rtdb_listener_active,
             })
         except Exception:
             pass  # Heartbeat failures are silent
