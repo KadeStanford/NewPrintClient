@@ -53,7 +53,7 @@ DEFAULT_PRINTER = os.environ.get("DEFAULT_PRINTER", "")
 CLIENT_ID = os.environ.get("CLIENT_ID", "ql-mac-client")
 CLIENT_NAME = os.environ.get("CLIENT_NAME", "Quality Tire Mac")
 FLASK_PORT = int(os.environ.get("FLASK_PORT", "7010"))
-FALLBACK_POLL_INTERVAL = int(os.environ.get("FALLBACK_POLL_INTERVAL", "30"))
+FALLBACK_POLL_INTERVAL = int(os.environ.get("FALLBACK_POLL_INTERVAL", "2"))
 
 FIREBASE_DB_URL = "https://qualityexpress-c19f2-default-rtdb.firebaseio.com"
 RTDB_SIGNAL_PATH = "printers/pendingSignal"
