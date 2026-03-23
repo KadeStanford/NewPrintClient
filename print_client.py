@@ -11,6 +11,7 @@ Designed for Brother QL-800 label printers on macOS.
 """
 
 import os
+import shutil
 import sys
 import re
 import time
@@ -577,17 +578,35 @@ def start_rtdb_sse_listener():
     return rtdb_listener_active
 
 
+def _find_cloudflared():
+    """Return the absolute path to cloudflared, or None if not installed.
+    Checks shutil.which first, then known Homebrew install locations so the
+    binary is found even when /opt/homebrew/bin is not in the process PATH."""
+    found = shutil.which("cloudflared")
+    if found:
+        return found
+    for candidate in [
+        "/opt/homebrew/bin/cloudflared",   # Apple Silicon Homebrew
+        "/usr/local/bin/cloudflared",      # Intel Homebrew
+        "/home/linuxbrew/.linuxbrew/bin/cloudflared",  # Linux Homebrew
+    ]:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def start_cloudflared_tunnel():
     """Spawn cloudflared as a managed subprocess and auto-discover the tunnel URL.
     A watchdog thread keeps it running and updates cloudflare_tunnel_url whenever
     cloudflared restarts with a new URL. Silently skips if cloudflared is not installed."""
     global _cloudflared_proc, cloudflare_tunnel_url
 
-    if subprocess.run(["which", "cloudflared"],
-                      capture_output=True).returncode != 0:
+    cf_bin = _find_cloudflared()
+    if not cf_bin:
         add_log("cloudflared not found — tunnel disabled (run setup_cloudflared.command to install)", "warn")
         return
 
+    add_log(f"cloudflared found at {cf_bin}")
     metrics_port = FLASK_PORT + 1
     url_pattern  = re.compile(r'https://[a-z0-9\-]+\.trycloudflare\.com')
 
@@ -596,7 +615,7 @@ def start_cloudflared_tunnel():
         while polling_active:
             add_log("Starting Cloudflare tunnel...")
             _cloudflared_proc = subprocess.Popen(
-                ["cloudflared", "tunnel",
+                [cf_bin, "tunnel",
                  "--url",     f"http://localhost:{FLASK_PORT}",
                  "--metrics", f"localhost:{metrics_port}"],
                 stdout=subprocess.PIPE,
