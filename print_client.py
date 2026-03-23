@@ -52,7 +52,7 @@ DEFAULT_PRINTER = os.environ.get("DEFAULT_PRINTER", "")
 CLIENT_ID = os.environ.get("CLIENT_ID", "ql-mac-client")
 CLIENT_NAME = os.environ.get("CLIENT_NAME", "Quality Tire Mac")
 FLASK_PORT = int(os.environ.get("FLASK_PORT", "7010"))
-FALLBACK_POLL_INTERVAL = int(os.environ.get("FALLBACK_POLL_INTERVAL", "60"))
+FALLBACK_POLL_INTERVAL = int(os.environ.get("FALLBACK_POLL_INTERVAL", "3"))
 
 FIREBASE_DB_URL = "https://qualityexpress-c19f2-default-rtdb.firebaseio.com"
 RTDB_SIGNAL_PATH = "printers/pendingSignal"
@@ -473,7 +473,7 @@ def start_rtdb_sse_listener():
 
     def sse_thread():
         global rtdb_listener_active
-        reconnect_delay = 2
+        reconnect_delay = 0.5
         # Tracks the last jobId we triggered on so we don't fire twice for
         # the same signal.  None on first-ever connect: the initial RTDB value
         # is used purely to establish a baseline (no wake fired for it).
@@ -486,13 +486,13 @@ def start_rtdb_sse_listener():
                 add_log("SSE: connecting to Firebase RTDB...")
                 resp = http_requests.get(
                     sse_url,
-                    headers={"Accept": "text/event-stream"},
+                    headers={"Accept": "text/event-stream", "Cache-Control": "no-cache"},
                     stream=True,
-                    timeout=(10, None),
+                    timeout=(10, 45),  # 45s read timeout; Firebase keep-alives arrive every ~30s
                 )
                 resp.raise_for_status()
                 rtdb_listener_active = True
-                reconnect_delay = 2
+                reconnect_delay = 0.5  # reset on successful connect
                 current_event_type = None
 
                 for raw_line in resp.iter_lines():
@@ -563,7 +563,7 @@ def start_rtdb_sse_listener():
 
             if polling_active and _sse_generation == my_gen:
                 time.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, 30)
+                reconnect_delay = min(reconnect_delay * 2, 5)  # cap at 5s, not 30s
 
     thread = threading.Thread(target=sse_thread, daemon=True, name="rtdb-sse")
     thread.start()
@@ -582,7 +582,7 @@ def poll_loop():
     if has_rtdb:
         add_log(f"Listening via Firebase RTDB (instant) + safety-net poll every {FALLBACK_POLL_INTERVAL}s")
     else:
-        add_log(f"RTDB stream not connected yet — polling every {FALLBACK_POLL_INTERVAL}s (RTDB retrying in background)")
+        add_log(f"RTDB stream connecting — polling every {FALLBACK_POLL_INTERVAL}s until SSE is live")
 
     while polling_active:
         try:
