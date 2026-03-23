@@ -83,6 +83,10 @@ HEARTBEAT_INTERVAL = 30  # seconds between heartbeats
 # Threading event: set by the RTDB SSE listener to wake the poll loop instantly
 wake_event = threading.Event()
 rtdb_listener_active = False
+
+# Cloudflare Tunnel — managed subprocess; URL auto-discovered from cloudflared stdout
+cloudflare_tunnel_url: str = ""
+_cloudflared_proc = None
 # Incremented each time a new SSE listener is started; old threads check this
 # against their own captured generation and exit when superseded, preventing
 # the zombie-double-connection race that causes duplicate wake-up fires.
@@ -573,6 +577,50 @@ def start_rtdb_sse_listener():
     return rtdb_listener_active
 
 
+def start_cloudflared_tunnel():
+    """Spawn cloudflared as a managed subprocess and auto-discover the tunnel URL.
+    A watchdog thread keeps it running and updates cloudflare_tunnel_url whenever
+    cloudflared restarts with a new URL. Silently skips if cloudflared is not installed."""
+    global _cloudflared_proc, cloudflare_tunnel_url
+
+    if subprocess.run(["which", "cloudflared"],
+                      capture_output=True).returncode != 0:
+        add_log("cloudflared not found — tunnel disabled (run setup_cloudflared.command to install)", "warn")
+        return
+
+    metrics_port = FLASK_PORT + 1
+    url_pattern  = re.compile(r'https://[a-z0-9\-]+\.trycloudflare\.com')
+
+    def _watchdog():
+        global _cloudflared_proc, cloudflare_tunnel_url
+        while polling_active:
+            add_log("Starting Cloudflare tunnel...")
+            _cloudflared_proc = subprocess.Popen(
+                ["cloudflared", "tunnel",
+                 "--url",     f"http://localhost:{FLASK_PORT}",
+                 "--metrics", f"localhost:{metrics_port}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            cloudflare_tunnel_url = ""   # reset until we see the new URL
+            for line in _cloudflared_proc.stdout:
+                m = url_pattern.search(line)
+                if m and not cloudflare_tunnel_url:
+                    cloudflare_tunnel_url = m.group(0)
+                    add_log(f"Cloudflare tunnel active: {cloudflare_tunnel_url}")
+                if not polling_active:
+                    _cloudflared_proc.terminate()
+                    break
+            _cloudflared_proc.wait()
+            if polling_active:
+                cloudflare_tunnel_url = ""
+                add_log("Cloudflare tunnel exited — restarting in 5s...", "warn")
+                time.sleep(5)
+
+    threading.Thread(target=_watchdog, daemon=True, name="cloudflared-watchdog").start()
+
+
 def poll_loop():
     """Background thread: waits for RTDB signal or fallback timeout, then checks for jobs."""
     global polling_active
@@ -656,12 +704,13 @@ def heartbeat_loop():
             # Send heartbeat
             printers, _ = get_cups_printers()
             api_post("/api/print/clients/heartbeat", {
-                "clientId": CLIENT_ID,
+                "clientId":     CLIENT_ID,
                 "printerCount": len(printers),
-                "stats": job_stats.copy(),
+                "stats":        job_stats.copy(),
                 "rtdbConnected": rtdb_listener_active,
-                "sseWakes": job_stats["sse_wakes"],
+                "sseWakes":     job_stats["sse_wakes"],
                 "fallbackWakes": job_stats["fallback_wakes"],
+                "tunnelUrl":    cloudflare_tunnel_url or None,
             })
         except Exception:
             pass  # Heartbeat failures are silent
@@ -948,6 +997,20 @@ def stop_polling():
     return jsonify({"message": "Polling stopped"})
 
 
+@app.route("/api/print/jobs/receive", methods=["POST"])
+def receive_job():
+    """Direct-push endpoint called by the Cloud Function via Cloudflare Tunnel.
+    Bypasses polling entirely — job is printed within milliseconds of being created."""
+    key = request.headers.get("X-API-Key") or request.args.get("token")
+    if API_KEY and key != API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+    job = request.json
+    if not job or not job.get("id"):
+        return jsonify({"error": "Invalid job payload — 'id' required"}), 400
+    threading.Thread(target=process_job, args=(job,), daemon=True).start()
+    return jsonify({"message": "received", "jobId": job["id"]}), 202
+
+
 @app.route("/api/test-connection")
 def test_connection():
     try:
@@ -1017,6 +1080,8 @@ def setup():
 
     log.info(f"  Dashboard: http://localhost:{FLASK_PORT}")
     log.info("")
+
+    start_cloudflared_tunnel()
 
 
 def run_flask():
