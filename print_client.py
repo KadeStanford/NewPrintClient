@@ -607,21 +607,36 @@ def start_cloudflared_tunnel():
         return
 
     add_log(f"cloudflared found at {cf_bin}")
-    metrics_port = FLASK_PORT + 1
-    url_pattern  = re.compile(r'https://[a-z0-9\-]+\.trycloudflare\.com')
+    url_pattern = re.compile(r'https://[a-z0-9\-]+\.trycloudflare\.com')
+
+    def _kill_stale():
+        """Kill any orphaned cloudflared quick-tunnel processes left from a previous session."""
+        try:
+            subprocess.run(
+                ["pkill", "-f", "cloudflared tunnel --url"],
+                capture_output=True, timeout=5
+            )
+            time.sleep(1)  # brief pause so the port is freed
+        except Exception:
+            pass
 
     def _watchdog():
         global _cloudflared_proc, cloudflare_tunnel_url
+        _kill_stale()
         while polling_active:
             add_log("Starting Cloudflare tunnel...")
-            _cloudflared_proc = subprocess.Popen(
-                [cf_bin, "tunnel",
-                 "--url",     f"http://localhost:{FLASK_PORT}",
-                 "--metrics", f"localhost:{metrics_port}"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
+            try:
+                _cloudflared_proc = subprocess.Popen(
+                    [cf_bin, "tunnel", "--url", f"http://localhost:{FLASK_PORT}"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            except Exception as e:
+                add_log(f"cloudflared failed to start: {e}", "error")
+                time.sleep(10)
+                continue
+
             cloudflare_tunnel_url = ""   # reset until we see the new URL
             for line in _cloudflared_proc.stdout:
                 m = url_pattern.search(line)
@@ -631,6 +646,9 @@ def start_cloudflared_tunnel():
                 if not polling_active:
                     _cloudflared_proc.terminate()
                     break
+                # Log cloudflared errors so they're visible in the dashboard
+                if "ERR" in line or "error" in line.lower():
+                    add_log(f"cloudflared: {line.rstrip()}", "warn")
             _cloudflared_proc.wait()
             if polling_active:
                 cloudflare_tunnel_url = ""
