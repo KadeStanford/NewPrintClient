@@ -447,7 +447,9 @@ def start_rtdb_sse_listener():
     def sse_thread():
         global rtdb_listener_active
         reconnect_delay = 2
-        first_event = True
+        # Track the last jobId we saw so we don't skip a real signal on reconnect.
+        # Using a mutable container so the inner scope can update it.
+        last_seen = {"jobId": None}
 
         while polling_active:
             try:
@@ -461,7 +463,7 @@ def start_rtdb_sse_listener():
                 resp.raise_for_status()
                 rtdb_listener_active = True
                 reconnect_delay = 2
-                first_event = True
+                current_event_type = None
 
                 for raw_line in resp.iter_lines():
                     if not polling_active:
@@ -471,6 +473,11 @@ def start_rtdb_sse_listener():
 
                     line = raw_line.decode("utf-8", errors="replace")
 
+                    # Track the event type so we can act on put/patch only
+                    if line.startswith("event:"):
+                        current_event_type = line[6:].strip()
+                        continue
+
                     if not line.startswith("data:"):
                         continue
 
@@ -478,15 +485,31 @@ def start_rtdb_sse_listener():
                     if not payload or payload == "null":
                         continue
 
-                    if first_event:
-                        first_event = False
+                    # Only wake on put/patch events (ignore cancel, auth_revoked, etc.)
+                    if current_event_type not in (None, "put", "patch"):
+                        current_event_type = None
                         continue
+                    current_event_type = None
 
                     try:
                         data = json.loads(payload)
-                        if isinstance(data, dict) and data.get("data"):
-                            add_log(">>> RTDB wake-up signal received — checking for jobs")
-                            wake_event.set()
+                        if not isinstance(data, dict):
+                            continue
+
+                        signal_data = data.get("data")
+                        if not signal_data or not isinstance(signal_data, dict):
+                            continue
+
+                        incoming_job_id = signal_data.get("jobId")
+
+                        # Skip if this is the same signal we already acted on
+                        # (e.g. the initial state event on reconnect)
+                        if incoming_job_id and incoming_job_id == last_seen["jobId"]:
+                            continue
+
+                        last_seen["jobId"] = incoming_job_id
+                        add_log(">>> RTDB wake-up signal received — checking for jobs")
+                        wake_event.set()
                     except json.JSONDecodeError:
                         pass
 
