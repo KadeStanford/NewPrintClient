@@ -405,20 +405,37 @@ def process_job(job):
             job_stats["completed"] += 1
         else:
             add_log(f"  Print failed: {message}", "error", job_id=job_id, printer=printer)
+            # Permanent failures: printer doesn't exist in CUPS, bad PDF data, CUPS not installed.
+            # These will never succeed on retry — mark as permanently failed.
+            permanent_errors = (
+                "no such file or directory",
+                "does not exist",
+                "unknown destination",
+                "lp command not found",
+                "not a valid pdf",
+            )
+            is_permanent = any(p in message.lower() for p in permanent_errors)
             api_post(f"/api/print/jobs/{job_id}/fail", {
                 "clientId": CLIENT_ID,
                 "errorMessage": f"CUPS error: {message}",
-                "shouldRetry": True,
+                "shouldRetry": not is_permanent,
             })
             job_stats["failed"] += 1
 
     except Exception as e:
-        add_log(f"  Error processing job: {e}", "error")
+        err_str = str(e)
+        add_log(f"  Error processing job: {err_str}", "error")
+        permanent_exc_errors = (
+            "invalid base64",
+            "not a valid pdf",
+            "no such file or directory",
+        )
+        is_permanent_exc = any(p in err_str.lower() for p in permanent_exc_errors)
         try:
             api_post(f"/api/print/jobs/{job_id}/fail", {
                 "clientId": CLIENT_ID,
-                "errorMessage": str(e),
-                "shouldRetry": True,
+                "errorMessage": err_str,
+                "shouldRetry": not is_permanent_exc,
             })
         except Exception:
             pass
