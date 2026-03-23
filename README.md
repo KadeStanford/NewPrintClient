@@ -28,7 +28,37 @@ Admin Dashboard (web)  →  Firebase Cloud Queue  →  This Print Client  →  L
 
 ## Install (Mac)
 
-### Step 1: Download the code
+There are two ways to install — pick the one that suits you:
+
+| | Option | Best for |
+|-|--------|----------|
+| ⭐ | **DMG app installer** (recommended) | Everyone — no Terminal needed |
+| 🛠 | **Terminal / script installer** | Developers or advanced users |
+
+---
+
+### Option A — DMG App (Recommended)
+
+This is the easiest way. You get a native Mac app that lives in your Applications folder.
+
+1. **Download** `QL-Print-Client-v2.0.dmg` from the [Releases page](https://github.com/KadeStanford/NewPrintClient/releases) (or from the root of this repo).
+2. **Open** the `.dmg` file (double-click it in Finder).
+3. **Drag** the **QL Print Client** icon into your **Applications** folder.
+4. **Eject** the disk image (drag it to Trash or right-click → Eject).
+5. **Open** the app from your Applications folder or Launchpad.
+
+> **First launch security prompt?** macOS may show *"QL Print Client can't be opened because it is from an unidentified developer."*
+> Go to **System Settings → Privacy & Security**, scroll down, and click **Open Anyway**.
+
+That's it — the app window opens and the print client starts automatically.
+
+---
+
+### Option B — Terminal / Script Installer
+
+Use this approach if you prefer working in Terminal or want to run the Python source directly.
+
+#### Step 1: Download the code
 
 Open **Terminal** (press `Cmd + Space`, type `Terminal`, hit Enter) and paste these commands one at a time:
 
@@ -40,7 +70,7 @@ cd NewPrintClient
 
 > **Don't have `git`?** If you get "command not found", macOS will prompt you to install Command Line Tools — click **Install** and try again. Or download the ZIP from https://github.com/KadeStanford/NewPrintClient → green **Code** button → **Download ZIP**, unzip it, then `cd ~/Downloads/NewPrintClient-main`.
 
-### Step 2: Run the installer
+#### Step 2: Run the installer
 
 ```bash
 chmod +x install.sh
@@ -56,7 +86,7 @@ The installer will:
 
 That's it. The print client is now running.
 
-### Step 3: Verify it's working
+#### Step 3: Verify it's working
 
 1. Open your browser and go to **http://localhost:7010**
 2. You should see the dashboard with:
@@ -75,8 +105,9 @@ Pick whichever method you prefer:
 
 | Method | How |
 |--------|-----|
-| **Desktop shortcut** | Double-click **Start Print Client** on your Desktop |
-| **Terminal** | Run `~/ql-print-client/start.sh` |
+| **App (DMG install)** | Open **QL Print Client** from Applications or Launchpad |
+| **Desktop shortcut** | Double-click **Start Print Client** on your Desktop *(script install only)* |
+| **Terminal** | Run `~/ql-print-client/start.sh` *(script install only)* |
 | **Auto-start** | If enabled during install, it starts when you log in — nothing to do |
 
 ### Dashboard
@@ -202,10 +233,13 @@ rm -f ~/Library/LaunchAgents/com.qualitytire.printclient.plist
 
 ```
 NewPrintClient/
-  print_client.py       ← Main application
-  requirements.txt      ← Python dependencies (flask, requests)
-  install.sh            ← macOS installer
-  README.md             ← This file
+  print_client.py                ← Main application
+  launcher.py                    ← Native app launcher (pywebview)
+  requirements.txt               ← Python dependencies (flask, requests)
+  install.sh                     ← macOS script installer
+  QL-Print-Client-v2.0.dmg       ← macOS app installer (drag-and-drop)
+  build_app/                     ← PyInstaller build artifacts for the .app
+  README.md                      ← This file
 ```
 
 After installation:
